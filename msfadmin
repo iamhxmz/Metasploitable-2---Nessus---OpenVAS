@@ -1,0 +1,178 @@
+# Network Vulnerability Assessment Lab — Metasploitable 2
+### Tools: Nmap, OpenVAS (Greenbone), Nessus
+
+---
+
+## 0. Lab Setup & Scope of Engagement
+
+**Environment**
+- Attacker machine: Kali Linux (with Nmap, GVM/OpenVAS, and Nessus installed)
+- Target: Metasploitable 2 VM (intentionally vulnerable, built by Rapid7 for training)
+- Network: Both VMs on the same **host-only / internal virtual network** (e.g., `192.168.56.0/24`), with **no bridge to the internet or production network**
+
+**Identify IPs first**
+
+```bash
+ip a          # run on Kali
+ifconfig      # run on Metasploitable 2 (login: msfadmin/msfadmin)
+```
+*Purpose:* Confirms each machine's IP so all scans target the correct lab system, not an unintended host.
+
+> **Scope note:** Every command below assumes the target IP is `192.168.56.102` (example). Replace with your actual lab IP. This guide is for an isolated lab only — running these against systems you don't own/have written authorization for is illegal in most jurisdictions.
+
+---
+
+## Phase 1: Reconnaissance with Nmap
+
+### 1.1 Host Discovery
+```bash
+nmap -sn 192.168.56.0/24
+```
+*Purpose:* `-sn` (ping scan, no port scan) sweeps the subnet to confirm the target VM is up and reachable before doing anything heavier.
+
+### 1.2 Full Port Scan
+```bash
+nmap -p- -T4 192.168.56.102
+```
+*Purpose:* `-p-` scans all 65,535 TCP ports (Metasploitable 2 deliberately exposes ~20+ services, so a default top-1000 scan would miss several). `-T4` speeds up timing for a lab environment.
+
+### 1.3 Service & Version Detection
+```bash
+nmap -sV -sC -p 21,22,23,25,53,80,111,139,445,512,513,514,1099,1524,2049,3306,3632,5432,5900,6000,6667,8009,8180 192.168.56.102
+```
+*Purpose:*
+- `-sV` identifies the service **and version** running on each port — this is the single most important step, because vulnerabilities are tied to specific versions (e.g., "vsftpd 2.3.4" vs just "FTP").
+- `-sC` runs Nmap's default safe script set (banner grabs, basic enumeration) for extra context without being intrusive.
+
+### 1.4 OS Fingerprinting
+```bash
+nmap -O 192.168.56.102
+```
+*Purpose:* Identifies the underlying OS (Ubuntu 8.04 in Metasploitable 2's case) — useful for understanding the patch baseline and likely kernel-level issues.
+
+### 1.5 Targeted Vulnerability Scripts (NSE)
+```bash
+nmap --script vuln -p 21,80,139,445,3632,6667,8180 192.168.56.102
+```
+*Purpose:* The `vuln` NSE script category actively checks discovered services against known CVE signatures (e.g., it will directly flag the vsftpd 2.3.4 backdoor and Samba usermap_script vulnerability). This bridges raw recon into actual findings before you even open a scanner GUI.
+
+---
+
+## Phase 2: Vulnerability Scanning — OpenVAS / Greenbone (GVM)
+
+### 2.1 Initialize and Update Feeds
+```bash
+sudo gvm-setup
+sudo gvm-feed-update
+sudo gvm-start
+```
+*Purpose:* `gvm-setup` builds the database and initial config on first run. `gvm-feed-update` pulls the latest NVT (Network Vulnerability Test) and CVE definitions — without this, scan results would be based on stale vulnerability data. `gvm-start` launches the scanner and web UI (Greenbone Security Assistant, usually `https://127.0.0.1:9392`).
+
+### 2.2 Create a Target
+In the GSA web interface:
+`Configuration → Targets → New Target`
+- Name: `Metasploitable2`
+- Host: `192.168.56.102`
+
+*Purpose:* Defines exactly which host(s) the scan engine is permitted to probe — keeps the scan scoped and auditable.
+
+### 2.3 Create and Launch a Scan Task
+`Configuration → Tasks → New Task`
+- Target: `Metasploitable2`
+- Scan Config: **Full and fast**
+- Click **Start**
+
+*Purpose:* "Full and fast" runs the broad NVT library against all detected open ports/services, balancing depth with scan time for a lab-sized target.
+
+### 2.4 Review Results
+`Scans → Results` — sort by **Severity (CVSS)**
+
+*Purpose:* Findings are auto-mapped to CVE IDs and CVSS scores, giving you a prioritized list (e.g., it will flag the Samba, vsftpd, and UnrealIRCd issues as Critical/High).
+
+---
+
+## Phase 3: Vulnerability Scanning — Nessus (Essentials)
+
+### 3.1 Setup
+- Install via `.deb`/`.rpm`, then:
+```bash
+sudo systemctl start nessusd
+```
+- Browse to `https://localhost:8834`, activate with your Essentials key, and wait for the plugin feed to download.
+
+*Purpose:* The plugin feed is Nessus's equivalent of OpenVAS's NVTs — it's the database of vulnerability checks the engine runs against the target.
+
+### 3.2 Create a Scan
+`New Scan → Basic Network Scan`
+- Name: `Metasploitable2-Assessment`
+- Targets: `192.168.56.102`
+- Save → **Launch**
+
+*Purpose:* A "Basic Network Scan" template runs host discovery, port scanning, and the core vulnerability plugin set — a good default for an unauthenticated external-style assessment.
+
+### 3.3 Review Results
+Open the completed scan → review by severity tab (**Critical / High / Medium / Low / Info**)
+
+*Purpose:* Each finding includes a description, CVSS score, affected port/service, and **Solution** field — directly usable for the remediation section of your report.
+
+---
+
+## Phase 4: Key Findings — Mapped to CVEs and Real-World Context
+
+These are the vulnerabilities both scanners and the Nmap `vuln` scripts should consistently surface on Metasploitable 2. Each is paired with a short real-world reference point — not because these exact instances were ever exploited "in the wild" via this lab, but because the *same flaw class* has caused real incidents.
+
+| Port/Service | Vulnerability | CVE | Real-world reference |
+|---|---|---|---|
+| 21 — vsftpd 2.3.4 | Backdoored command shell triggered via crafted username | CVE-2011-2523 | In 2011, the official vsftpd-2.3.4 source tarball on the project's download server was replaced with a malicious version containing this backdoor for roughly a month before being caught — a real supply-chain compromise. |
+| 6667 — UnrealIRCd 3.2.8.1 | Backdoored daemon allows remote command execution | CVE-2010-2075 | In 2009–2010, the official UnrealIRCd download archive was similarly replaced with a trojanized build that was distributed for months. |
+| 139/445 — Samba | "username map script" allows remote command execution | CVE-2007-2447 | This is a different bug class than, but conceptually related to, the 2017 "SambaCry" flaw (CVE-2017-7494) that was used in real cryptocurrency-mining worm campaigns against exposed Samba servers. |
+| 3632 — distccd | Misconfigured to accept commands from any host, allowing arbitrary code execution | CVE-2004-2687 | Distcc misconfigurations have historically been a common "easy win" in CTFs and real internet-facing exposure scans (e.g., flagged repeatedly in Shodan-based research on exposed build services). |
+| 1099 — Java RMI Registry | Insecure default config allows remote class loading / code execution | CVE-2011-3556 | Java RMI exposure is a recurring finding in real enterprise pentests where internal management interfaces are accidentally reachable. |
+| 5900 — VNC | No/weak authentication ("password") | N/A (config issue) | Open VNC servers with blank/default passwords have repeatedly been found exposed on the open internet via mass scans, leading to real unauthorized desktop access incidents. |
+| 512–514 — rsh/rlogin | Cleartext, trust-based remote login (`.rhosts`) | N/A (legacy protocol) | r-services were a primary lateral-movement vector in real intrusions through the 1990s–2000s, which is why they're now considered legacy/deprecated in hardened environments. |
+| 2049 — NFS | World-exported shares with no host restriction | N/A (config issue) | Misconfigured NFS exports remain a common finding in internal network assessments, often leading to sensitive file disclosure. |
+| 8180 — Apache Tomcat | Default/weak manager credentials (`tomcat:tomcat`) | N/A (config issue) | Default credential reuse on management consoles is consistently one of the top initial-access methods cited in annual breach reports (e.g., Verizon DBIR). |
+
+---
+
+## Phase 5: Risk Prioritization (CVSS)
+
+When triaging the combined Nmap/OpenVAS/Nessus output, group findings by CVSS v3 score:
+
+- **Critical (9.0–10.0):** vsftpd backdoor, UnrealIRCd backdoor, Samba RCE, distccd RCE — these allow direct remote code execution with no authentication. Remediate first.
+- **High (7.0–8.9):** Java RMI exploitation, Tomcat default credentials (leads to RCE via WAR upload).
+- **Medium (4.0–6.9):** Weak/no-auth VNC, NFS misconfiguration, legacy r-services.
+- **Low/Informational:** Outdated banners, verbose error messages, unencrypted protocols (telnet, FTP) where exploitation requires additional conditions.
+
+*Purpose of this step:* Ensures the report doesn't bury a Critical RCE under a long list of informational findings — prioritization is what turns a scan output into an actionable assessment.
+
+---
+
+## Phase 6: Reporting Structure
+
+A clean VAPT report for this lab should include:
+
+1. **Executive Summary** — plain-language overview: "X critical, Y high-risk vulnerabilities found, including multiple unauthenticated remote code execution paths."
+2. **Scope & Methodology** — IP ranges tested, tools/versions used (Nmap version, OpenVAS feed date, Nessus plugin date), dates of testing.
+3. **Findings Table** — CVE, affected host/port, CVSS score, description, evidence (scan output excerpt).
+4. **Risk Ranking** — as in Phase 5.
+5. **Remediation Recommendations** — see Phase 7.
+6. **Appendix** — raw Nmap/OpenVAS/Nessus output.
+
+---
+
+## Phase 7: Remediation Recommendations
+
+- **Patch or replace** vsftpd, UnrealIRCd, and Samba with current, supported versions — these specific backdoored versions should never exist outside this training VM.
+- **Disable distccd** entirely on internet/network-facing hosts, or restrict it to localhost via firewall rules.
+- **Restrict NFS exports** to specific trusted hosts using `/etc/exports` host ACLs.
+- **Disable or remove r-services** (`rsh`, `rlogin`, `rexec`) in favor of SSH.
+- **Set strong, unique VNC passwords** or disable VNC if not needed; tunnel over SSH if remote access is required.
+- **Change default credentials** on Tomcat Manager (and any other management interface) immediately after install.
+- **Network segmentation** — even with patches applied, management interfaces and legacy protocols should sit on a restricted VLAN, not a flat network.
+
+---
+
+## Closing Note
+
+This walkthrough intentionally stays at the "standard methodology" level — Nmap for recon, OpenVAS/Nessus for automated vulnerability identification, and CVE/CVSS for prioritization — which mirrors how a real internal VA is structured. The real-world references above are included for context on *why* each finding matters, not as exploitation instructions; exploitation/post-exploitation (e.g., via Metasploit modules) is a separate phase with its own authorization requirements and is outside the scope of this assessment guide.
